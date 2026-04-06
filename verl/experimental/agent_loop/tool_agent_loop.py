@@ -40,6 +40,15 @@ from verl.workers.rollout.replica import TokenOutput
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Injected when thinking exceeds thinking_budget (mask=0, not trained on).
+# Token length for Qwen3.5-4B: 15.
+# Recompute for other models:
+#   python3 -c "from transformers import AutoTokenizer; t=AutoTokenizer.from_pretrained('<model>'); \
+#     print(len(t.encode(THINK_INTERRUPT_PHRASE, add_special_tokens=False)))"
+# NOTE: do NOT mention "final answer" here — that biases the model to skip tool calls.
+# "Let me continue" is intentionally neutral: the model decides tool vs direct answer.
+THINK_INTERRUPT_PHRASE = "\nOkay, I have thought enough. Let me continue.\n</think>\n"
+
 
 class AgentState(Enum):
     PENDING = "pending"
@@ -112,6 +121,33 @@ class ToolAgentLoop(AgentLoopBase):
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
+
+        # Think-interrupt: cap runaway thinking and redirect the model to call a tool.
+        # Both fields must be set together (or both None = feature disabled).
+        self.thinking_budget = self.rollout_config.multi_turn.thinking_budget
+        self.tool_call_budget = self.rollout_config.multi_turn.tool_call_budget
+        if self.thinking_budget is not None:
+            assert self.tool_call_budget is not None, (
+                "tool_call_budget must be set when thinking_budget is set"
+            )
+            # Precompute once — not on the per-trajectory hot path.
+            self._interrupt_ids: list[int] = self.tokenizer.encode(
+                THINK_INTERRUPT_PHRASE, add_special_tokens=False
+            )
+            self._think_end_id: int = self.tokenizer.convert_tokens_to_ids("</think>")
+            # Budget identity (enforced here so misconfiguration is caught at startup):
+            #   response_length = thinking_budget + len(interrupt_ids)
+            #                   + tool_call_budget + max_tool_response_length
+            #                   + answer_budget   (implicit remainder, must be > 0)
+            _overhead = len(self._interrupt_ids) + self.max_tool_response_length
+            assert self.thinking_budget + self.tool_call_budget + _overhead < self.response_length, (
+                f"No room for answer tokens: thinking_budget ({self.thinking_budget}) "
+                f"+ tool_call_budget ({self.tool_call_budget}) "
+                f"+ interrupt ({len(self._interrupt_ids)}) "
+                f"+ max_tool_response_length ({self.max_tool_response_length}) "
+                f"= {self.thinking_budget + self.tool_call_budget + _overhead} "
+                f">= response_length ({self.response_length})"
+            )
 
         # Initialize interactions from config file
         self.interaction_config_file = self.rollout_config.multi_turn.interaction_config_path
@@ -217,11 +253,16 @@ class ToolAgentLoop(AgentLoopBase):
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
 
+        _sc1_params = (
+            {**sampling_params, "max_tokens": self.thinking_budget}
+            if self.thinking_budget is not None
+            else sampling_params
+        )
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
                 prompt_ids=agent_data.prompt_ids,
-                sampling_params=sampling_params,
+                sampling_params=_sc1_params,
                 image_data=agent_data.image_data,
                 video_data=agent_data.video_data,
             )
@@ -249,6 +290,47 @@ class ToolAgentLoop(AgentLoopBase):
 
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
+
+        # --- Think-interrupt ---
+        # If thinking_budget is set and the model hit the budget without emitting </think>,
+        # inject the interrupt phrase (mask=0) then re-generate just the tool call.
+        if self.thinking_budget is not None and (
+            len(output.token_ids) >= self.thinking_budget
+            and self._think_end_id not in output.token_ids
+        ):
+            agent_data.prompt_ids += self._interrupt_ids
+            agent_data.response_mask += [0] * len(self._interrupt_ids)
+            if agent_data.response_logprobs:
+                agent_data.response_logprobs += [0.0] * len(self._interrupt_ids)
+
+            # simple_timer accumulates (+=), so sc2 time folds into the same
+            # "generate_sequences" key as sc1 — no new metric key, no overhead.
+            with simple_timer("generate_sequences", agent_data.metrics):
+                _output2: TokenOutput = await self.server_manager.generate(
+                    request_id=agent_data.request_id,
+                    prompt_ids=agent_data.prompt_ids,
+                    sampling_params={**sampling_params, "max_tokens": self.tool_call_budget},
+                    image_data=agent_data.image_data,
+                    video_data=agent_data.video_data,
+                )
+            agent_data.metrics["num_preempted"] = (
+                agent_data.metrics.get("num_preempted", 0) + (_output2.num_preempted or 0)
+            )
+            if _output2.extra_fields.get("max_global_steps"):
+                agent_data.extra_fields["max_global_steps"] = _output2.extra_fields["max_global_steps"]
+            # Overwrite response_ids so the tool parser sees the tool call, not the thinking.
+            agent_data.response_ids = _output2.token_ids
+            agent_data.prompt_ids += _output2.token_ids
+            agent_data.response_mask += [1] * len(_output2.token_ids)
+            # Logprobs: extend only if we were tracking them (sc1 produced logprobs).
+            # Use actual sc2 logprobs when available; fall back to zeros so that
+            # len(response_logprobs) == len(response_mask) is always maintained.
+            if agent_data.response_logprobs:
+                agent_data.response_logprobs += (
+                    _output2.log_probs if _output2.log_probs
+                    else [0.0] * len(_output2.token_ids)
+                )
+        # --- End think-interrupt ---
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
