@@ -41,13 +41,13 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Injected when thinking exceeds thinking_budget (mask=0, not trained on).
-# Token length for Qwen3.5-4B: 15.
-# Recompute for other models:
-#   python3 -c "from transformers import AutoTokenizer; t=AutoTokenizer.from_pretrained('<model>'); \
-#     print(len(t.encode(THINK_INTERRUPT_PHRASE, add_special_tokens=False)))"
-# NOTE: do NOT mention "final answer" here — that biases the model to skip tool calls.
-# "Let me continue" is intentionally neutral: the model decides tool vs direct answer.
-THINK_INTERRUPT_PHRASE = "\nOkay, I have thought enough. Let me continue.\n</think>\n"
+# Token count is derived at init via tokenizer.encode — no hardcoded length.
+# NOTE: do NOT mention "final answer" or "stop" here — biases the model to skip tool calls.
+# Do NOT say "continue" either — observed failure mode is the model continues thinking
+# in the (non-existent) content slot. "Time to write my response" is intentionally neutral
+# over the two valid next actions: <tool_call> or a direct \boxed{} answer.
+# Must stay in sync with src/phys_reasoner/tir/prompts.py::THINK_INTERRUPT_PHRASE.
+THINK_INTERRUPT_PHRASE = "\nOkay, I've thought enough. Time to write my response.\n</think>\n"
 
 
 class AgentState(Enum):
