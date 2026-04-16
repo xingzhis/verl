@@ -418,6 +418,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await self._fit_validate()
         self._fit_save_checkpoint(force=True)
 
+        # Explicitly finalize loggers (wandb, etc.) before the Ray actor is torn
+        # down.  Tracking.__del__ is unreliable inside Ray actors — the process can
+        # be killed before __del__ runs, leaving wandb runs stuck in "running"
+        # state with unsynced metrics.  Wrapped in try/except so a logging failure
+        # never masks a successful training run.
+        try:
+            self.logger.finish()
+        except Exception as e:
+            print(f"[FullyAsyncTrainer] logger.finish() failed (non-fatal): {e}")
+
     async def fit_step(self, batch_dict: dict = None):
         """
         Single-step training template method. Handles all logic for one training step.
