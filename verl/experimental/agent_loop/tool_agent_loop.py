@@ -135,6 +135,16 @@ class ToolAgentLoop(AgentLoopBase):
                 THINK_INTERRUPT_PHRASE, add_special_tokens=False
             )
             self._think_end_id: int = self.tokenizer.convert_tokens_to_ids("</think>")
+            # Drift guard: fail loud if the launcher's INTERRUPT_LEN constant (used
+            # to derive MAX_RESPONSE_LEN) disagrees with the real tokenized length.
+            # Otherwise the answer budget silently shrinks/grows when the phrase is edited.
+            _shell_hint = os.environ.get("INTERRUPT_LEN")
+            if _shell_hint is not None:
+                assert int(_shell_hint) == len(self._interrupt_ids), (
+                    f"INTERRUPT_LEN mismatch: launcher says {_shell_hint}, "
+                    f"tokenizer says {len(self._interrupt_ids)}. "
+                    f"Update INTERRUPT_LEN in the launcher script to {len(self._interrupt_ids)}."
+                )
             # Budget identity (enforced here so misconfiguration is caught at startup):
             #   response_length = thinking_budget + len(interrupt_ids)
             #                   + tool_call_budget + max_tool_response_length
