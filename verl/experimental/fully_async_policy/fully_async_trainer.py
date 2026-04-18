@@ -69,6 +69,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     ):
         # ==================== RayPPOTrainer config ====================
 
+        # DEBUG: verify placement of this Ray actor (remove after validation).
+        import socket as _socket
+        print(f"[FullyAsyncTrainer] placed on {_socket.gethostname()}", flush=True)
+
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.processor = processor

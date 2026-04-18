@@ -141,7 +141,20 @@ class FullyAsyncTaskRunner:
             if role != Role.Rollout
         }
 
-        trainer = FullyAsyncTrainer.remote(
+        # Pin the trainer coordinator actor to the node that hosts the trainer
+        # FSDP GPUs. Without this, Ray schedules this cpu-only actor on any
+        # node with ≥10 free CPUs (typically a rollout worker), which causes
+        # wandb's system monitor to report that rollout node's GPUs instead of
+        # the trainer GPUs. The `trainer_node` resource is advertised by the
+        # bring-up script on the trainer host only (see perlmutter
+        # _ray_bringup.sh / train_async_2node.sbatch). Fractional (0.001)
+        # leaves room for other actors that may also want to pin there. If the
+        # resource is not advertised (e.g. local dev), fall through.
+        trainer_opts: dict = {}
+        if ray.cluster_resources().get("trainer_node", 0) > 0:
+            trainer_opts["resources"] = {"trainer_node": 0.001}
+
+        trainer = FullyAsyncTrainer.options(**trainer_opts).remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
