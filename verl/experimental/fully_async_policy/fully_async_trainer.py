@@ -539,11 +539,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.local_trigger_step != 1:
             return
 
-        with marked_timer("timing_s/param_sync", self.timing_raw):
+        with marked_timer("param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "
-            f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
+            f"timing_s/param_sync: {self.timing_raw['param_sync']:.4f} seconds "
             f"self.current_param_version: {self.current_param_version}"
         )
 
@@ -608,13 +608,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         val_metrics: ValidateMetrics = ray.get(val_future)
         if train_val_metrics:
             # Merge trainer and rollouter validation results
-            with marked_timer("timing_s/merge_val", self.timing_raw):
+            with marked_timer("merge_val", self.timing_raw):
                 new_metrics = self._merge_validation_results(train_val_metrics, val_metrics.metrics)
             if new_metrics:
                 self.logger.log(data=new_metrics, step=self.current_param_version)
                 pprint(
                     f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
-                    f"Validation metrics: {new_metrics}, timing: {self.timing_raw['timing_s/merge_val']}"
+                    f"Validation metrics: {new_metrics}, timing: {self.timing_raw['merge_val']}"
                 )
         else:
             if val_metrics.metrics:
