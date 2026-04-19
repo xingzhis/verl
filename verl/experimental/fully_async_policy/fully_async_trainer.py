@@ -470,6 +470,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_save_checkpoint()
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
+        # Per-phase timing + rollouter counters to stdout. self.metrics contains
+        # timing_s/* keys from _fit_collect_metrics (trainer phases + any
+        # timing_s/agent_loop/* propagated from rollouter via batch.meta_info)
+        # and fully_async/count/* from _collect_metrics_from_samples. Printed
+        # BEFORE the next step's update_weights so a downstream OOM cannot eat
+        # this step's decomposition. Disable with VERL_PRINT_TIMING=0.
+        # Note: rollouter aggregate fully_async/rollouter/{active_time,version_time,
+        # idle_ratio} is already echoed by the console logger from _fit_update_weights.
+        if os.environ.get("VERL_PRINT_TIMING", "1") != "0":
+            parts = []
+            for k, v in sorted(self.metrics.items()):
+                if not k.startswith(("timing_s/", "fully_async/")):
+                    continue
+                parts.append(f"{k}={v:.2f}s" if k.startswith("timing_s/") else f"{k}={v}")
+            print(f"[FullyAsyncTrainer] step={self.global_steps} {' '.join(parts)}", flush=True)
         self._fit_torch_memory()
         self._fit_postprocess_step()
 
