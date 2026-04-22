@@ -157,19 +157,65 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     else:
         raise ValueError("All samples are aborted, this should not happen.")
 
+    # GRPO group-saturation diagnostics (added for PhysCode). Reuses the `uid`
+    # array that the advantage estimator already consumes; when all rollouts in
+    # a group share the same reward, the within-group advantage is zero and
+    # that prompt contributes nothing to the gradient that step. Under binary
+    # rewards, std == 0 iff all rollouts agree iff reward mean in {0, 1}.
+    group_metrics = {}
+    if "uid" in batch.non_tensor_batch:
+        import numpy as _np  # noqa: PLC0415
+        uids = _np.asarray(batch.non_tensor_batch["uid"])
+        non_aborted_np = non_aborted_mask.detach().cpu().numpy()
+        rewards_np = non_aborted_sequence_reward.detach().cpu().numpy().astype(_np.float64)
+        uids_valid = uids[non_aborted_np]
+        if uids_valid.size > 0:
+            _, inverse = _np.unique(uids_valid, return_inverse=True)
+            n_groups = int(inverse.max() + 1) if inverse.size else 0
+            counts = _np.bincount(inverse, minlength=n_groups).astype(_np.float64)
+            sums = _np.bincount(inverse, weights=rewards_np, minlength=n_groups)
+            sum_sq = _np.bincount(inverse, weights=rewards_np * rewards_np, minlength=n_groups)
+            safe_counts = _np.maximum(counts, 1.0)
+            means = sums / safe_counts
+            var = _np.maximum(sum_sq / safe_counts - means * means, 0.0)
+            saturated = int((var < 1e-12).sum())
+            all_right = int((means > 1.0 - 1e-6).sum())
+            all_wrong = int((means < 1e-6).sum())
+            if n_groups:
+                group_metrics = {
+                    "critic/group/n": float(n_groups),
+                    "critic/group/saturated_frac": saturated / n_groups,
+                    "critic/group/all_right_frac": all_right / n_groups,
+                    "critic/group/all_wrong_frac": all_wrong / n_groups,
+                    "critic/group/informative_frac": 1.0 - saturated / n_groups,
+                }
+
     metrics = {
         # score
         "critic/score/mean": score_mean,
         "critic/score/max": score_max,
         "critic/score/min": score_min,
+        # score std (across non-aborted sequences in this batch — a useful
+        # complement to the per-group saturation fraction below; if this
+        # collapses, the batch has lost reward diversity at the aggregate level)
+        "critic/score/std": torch.std(non_aborted_sequence_score).detach().item()
+            if non_aborted_sequence_score.numel() > 1 else 0.0,
         # reward
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
+        "critic/rewards/std": torch.std(non_aborted_sequence_reward).detach().item()
+            if non_aborted_sequence_reward.numel() > 1 else 0.0,
         # adv
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        # Advantage std — direct measure of the gradient signal magnitude.
+        # If this drops toward 0, the policy-gradient has nothing to push on.
+        "critic/advantages/std": torch.std(valid_adv).detach().item()
+            if valid_adv.numel() > 1 else 0.0,
+        # GRPO group-level saturation metrics (empty dict on non-GRPO runs)
+        **group_metrics,
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
         "critic/returns/max": torch.max(valid_returns).detach().item(),
