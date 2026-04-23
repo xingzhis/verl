@@ -195,6 +195,48 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+        # ScaleRL-style Zero-Variance Filtering (ZVF) — gated by
+        # `algorithm.filter_groups.enable`. Saturated groups (all-correct or
+        # all-wrong rollouts) already contribute zero gradient because their
+        # advantage = score - group_mean = 0. But under token-mean loss
+        # aggregation they DILUTE the denominator (sum of response_mask),
+        # halving the effective per-token loss when ~50% of the batch is
+        # saturated. Zeroing their tokens in response_mask removes them from
+        # both numerator and denominator, recovering the correct effective
+        # batch size. Reference: ScaleRL, arxiv:2510.13786 (Meta, Oct 2025).
+        # This is async-compatible (unlike DAPO's filter_groups which re-rolls).
+        fg = config.filter_groups if config is not None else None
+        if fg is not None and getattr(fg, "enable", False):
+            from collections import defaultdict
+            scores = data.batch["token_level_rewards"].sum(dim=-1)
+            uid = data.non_tensor_batch["uid"]
+            id2scores: dict = defaultdict(list)
+            for i, k in enumerate(uid):
+                id2scores[k].append(float(scores[i].item()))
+            zvf_eps = 1e-6
+            is_info_np = np.array(
+                [float(np.std(id2scores[uid[i]]) > zvf_eps) for i in range(len(uid))],
+                dtype=np.float32,
+            )
+            n_kept = int(is_info_np.sum())
+            n_total = int(len(uid))
+            if 0 < n_kept < n_total:
+                rm = data.batch["response_mask"]
+                is_info_t = torch.from_numpy(is_info_np).to(device=rm.device, dtype=rm.dtype)
+                data.batch["response_mask"] = rm * is_info_t.unsqueeze(-1)
+                print(
+                    f"[ZVF] kept {n_kept}/{n_total} samples after zero-variance mask "
+                    f"(saturated_dropped={n_total - n_kept})",
+                    flush=True,
+                )
+            elif n_kept == 0:
+                print(
+                    f"[ZVF] WARN: all {n_total} samples saturated; skipping mask "
+                    f"(no learning this step)",
+                    flush=True,
+                )
+            # else: n_kept == n_total → no saturated samples, mask unchanged
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
