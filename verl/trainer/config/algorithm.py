@@ -46,14 +46,29 @@ class FilterGroupsConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        enable (bool): Whether to enable filter groups.
+        enable (bool): Whether to enable filter groups (ZVF mask in async path / DAPO regenerate in sync).
         metric (Optional[str]): Metric to use for filtering: "acc", "score", "seq_reward", "seq_final_reward", etc.
         max_num_gen_batches (int): Non-positive values mean no upper limit.
+        drop_saturated_in_rollouter (bool): Async-path-only. When True, the rollouter
+            checks each completed group's reward distribution and drops the entire group
+            (all n rollouts) before enqueueing for the trainer if it is "saturated"
+            (variance below saturated_zvf_eps — typically all-correct or all-wrong).
+            Saves trainer memory + step time vs ZVF (which masks but still consumes
+            sequences in update_actor). Composes with ZVF (enable=True) — ZVF acts as
+            belt-and-suspenders for any saturated group that slips through (e.g. due
+            to floating-point std edge cases). Default False = unchanged behavior.
+            Async-friendly: the staleness queue absorbs the resulting slack as long as
+            rollouter throughput exceeds drops; bump rollout pool to compensate at
+            high saturated fractions.
+        saturated_zvf_eps (float): std threshold below which a group is considered
+            saturated. Default 1e-6 (matches ray_trainer.py ZVF threshold).
     """
 
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+    drop_saturated_in_rollouter: bool = False
+    saturated_zvf_eps: float = 1e-6
 
 
 @dataclass

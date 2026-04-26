@@ -158,6 +158,18 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.staleness_samples = 0
         self.dropped_stale_samples = 0
         self.processed_sample_count = 0
+
+        # Saturation drop (oversample-and-filter) — see FilterGroupsConfig docstring.
+        # Independent of ZVF (algorithm.filter_groups.enable). When both are on, drop here
+        # is "first line", ZVF is "second line" for any saturated group that slips through.
+        fg = config.algorithm.get("filter_groups", None) if config is not None else None
+        self.drop_saturated_in_rollouter = bool(
+            fg.get("drop_saturated_in_rollouter", False) if fg is not None else False
+        )
+        self.saturated_zvf_eps = float(
+            fg.get("saturated_zvf_eps", 1e-6) if fg is not None else 1e-6
+        )
+        self.dropped_saturated_groups = 0
         # we start from step 1
         self.global_steps = 1
         self.idle_start_time = time.time()
@@ -507,6 +519,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
         rollout_sample.rollout_status = await self.get_statistics()
 
+        # Oversample-and-filter: drop saturated groups (zero-variance reward) before
+        # they reach the trainer. See FilterGroupsConfig.drop_saturated_in_rollouter.
+        if self.drop_saturated_in_rollouter and self._is_group_saturated(rollout_sample.full_batch):
+            self.dropped_saturated_groups += 1
+            self.processed_sample_count += 1
+            return
+
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
         )
@@ -515,6 +534,34 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         else:
             self.dropped_stale_samples += 1
         self.processed_sample_count += 1
+
+    def _is_group_saturated(self, full_batch) -> bool:
+        """Return True if all rollouts in this group share (almost) the same reward
+        — i.e. all-correct or all-wrong, contributing zero advantage in GRPO.
+
+        At the rollouter stage, raw per-rollout rewards live in ``batch["rm_scores"]``
+        (populated by the agent loop's ``_compute_score`` → see
+        ``verl/experimental/agent_loop/agent_loop.py:913-919``). It's a sparse tensor
+        with the scalar reward placed at the last-valid-token position, so summing
+        over the sequence dimension recovers the scalar. Falls back to
+        ``token_level_rewards``/``token_level_scores`` if those happen to be set.
+        Returns False (no drop) if no reward signal is available — fail-safe.
+        """
+        try:
+            batch = full_batch.batch
+            if "rm_scores" in batch:
+                rewards = batch["rm_scores"].sum(dim=-1).float()
+            elif "token_level_rewards" in batch:
+                rewards = batch["token_level_rewards"].sum(dim=-1).float()
+            elif "token_level_scores" in batch:
+                rewards = batch["token_level_scores"].sum(dim=-1).float()
+            else:
+                return False
+            if rewards.numel() < 2:
+                return False
+            return float(rewards.std().item()) <= self.saturated_zvf_eps
+        except Exception:
+            return False
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -676,6 +723,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
+            "count/dropped_saturated_groups": self.dropped_saturated_groups,
             # static stats
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,
