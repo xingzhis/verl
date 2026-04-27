@@ -524,6 +524,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if self.drop_saturated_in_rollouter and self._is_group_saturated(rollout_sample.full_batch):
             self.dropped_saturated_groups += 1
             self.processed_sample_count += 1
+            # Decrement staleness_samples counter (incremented in _processor_worker
+            # at line ~474 on every pending_queue pull, regardless of outcome).
+            # Otherwise filter-drops accumulate against max_required_samples and
+            # pause the rollouter indefinitely between param syncs (which only
+            # reset staleness via reset_staleness()) -> pipeline deadlock at
+            # high drop rates.
+            async with self.lock:
+                self.staleness_samples = max(0, self.staleness_samples - 1)
             return
 
         success = await self.message_queue_client.put_sample(
