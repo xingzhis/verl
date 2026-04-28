@@ -628,8 +628,16 @@ class vLLMHttpServer:
                 # 2. Abort all in-flight requests
                 # 3. Wait for requests to drain
                 # 4. Clear prefix and mm caches if clear_cache=True
+                # Tier 1 fix toggle: vLLM 0.17.0 pause_generation(wait_for_inflight_requests=False)
+                # appears to drop abort signals to some per-request output queues, leaving
+                # async generators in `vLLMHttpServer.generate()` polling forever (silent stall).
+                # Setting wait_for_inflight_requests=True drains in-flight rollouts before pausing,
+                # eliminating the abort-delivery race entirely. Cost: each sync waits up to
+                # processing_time/max for in-flight to finish (~7 min worst case at sync_step=1).
+                # Off by default to preserve existing fast-sync behavior; on for diagnostic test.
+                _wait_inflight = os.environ.get("VERL_WAIT_INFLIGHT_AT_SYNC", "0") == "1"
                 await self.engine.pause_generation(
-                    wait_for_inflight_requests=False,
+                    wait_for_inflight_requests=_wait_inflight,
                     clear_cache=reset_prefix_cache,
                 )
             else:

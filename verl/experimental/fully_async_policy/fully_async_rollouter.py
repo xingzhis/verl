@@ -170,6 +170,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             fg.get("saturated_zvf_eps", 1e-6) if fg is not None else 1e-6
         )
         self.dropped_saturated_groups = 0
+
+        # Per-rollout timeout: if a sample's vLLM generate_sequences_single never
+        # resolves (observed at sync_step=1 silent stalls — vLLM/Ray future drop after
+        # an abort+wake_up cycle), the asyncio task becomes a zombie in active_tasks.
+        # _processor_worker holds self.lock around `await asyncio.wait(active_tasks)`
+        # in its drain/concurrency-cap branches, so a single zombie deadlocks the
+        # entire rollouter actor (and the trainer waiting on reset_staleness).
+        # asyncio.wait_for around the generation call lets each task cancel itself
+        # after timeout, freeing the slot and breaking the deadlock chain.
+        # Healthy max processing_time observed ~500s; default 900s = 1.8x safety.
+        self.rollout_timeout_sec = float(
+            getattr(config.async_training, "rollout_timeout_sec", 900.0)
+            if hasattr(config, "async_training") else 900.0
+        )
+        self.dropped_timeout_samples = 0
+
         # we start from step 1
         self.global_steps = 1
         self.idle_start_time = time.time()
@@ -511,8 +527,28 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
-        # Calling asynchronous generation methods
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        # Wrap the long-running vLLM generation call in asyncio.wait_for. If the
+        # underlying Ray future is dropped (silent stall observed at sync_step=1
+        # after a sync's abort+wake_up cycle), the task self-cancels and we drop
+        # this sample, freeing the active_tasks slot. NOTE: do NOT acquire
+        # self.lock in this handler — _processor_worker may be holding it inside
+        # an `await asyncio.wait(active_tasks)`, so reacquiring would deadlock
+        # exactly the chain we're trying to break.
+        try:
+            ret = await asyncio.wait_for(
+                self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch),
+                timeout=self.rollout_timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            print(
+                f"[FullyAsyncRollouter] sample {rollout_sample.sample_id} timed out "
+                f"after {self.rollout_timeout_sec}s; dropping (likely vLLM/Ray future drop)",
+                flush=True,
+            )
+            self.dropped_timeout_samples += 1
+            self.processed_sample_count += 1
+            self.staleness_samples = max(0, self.staleness_samples - 1)
+            return
         rollout_sample.full_batch = ret
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
@@ -529,9 +565,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Otherwise filter-drops accumulate against max_required_samples and
             # pause the rollouter indefinitely between param syncs (which only
             # reset staleness via reset_staleness()) -> pipeline deadlock at
-            # high drop rates.
-            async with self.lock:
-                self.staleness_samples = max(0, self.staleness_samples - 1)
+            # high drop rates. No lock — asyncio is single-threaded and the
+            # counter is read without lock at line ~711 / 732 anyway.
+            self.staleness_samples = max(0, self.staleness_samples - 1)
             return
 
         success = await self.message_queue_client.put_sample(
@@ -732,6 +768,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
             "count/dropped_saturated_groups": self.dropped_saturated_groups,
+            "count/dropped_timeout_samples": self.dropped_timeout_samples,
             # static stats
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,
